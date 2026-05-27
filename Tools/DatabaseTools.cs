@@ -630,6 +630,357 @@ public static class DatabaseTools
         }
     }
 
+    [McpServerTool(Name = "check_foreign_key")]
+    [Description(
+        "Checks for orphaned rows when a logical (un-enforced) foreign-key relationship exists. " +
+        "Counts rows in childTable whose childColumn value is not present in " +
+        "parentTable.parentColumn, and returns a sample of orphan values. Useful for auditing " +
+        "referential integrity in legacy schemas where FK constraints were never declared.")]
+    public static async Task<string> CheckForeignKey(
+        NpgsqlDataSource dataSource,
+        [Description("Child table (the one whose values reference the parent). May be schema-qualified.")] string childTable,
+        [Description("Column on the child table that should reference the parent.")] string childColumn,
+        [Description("Parent table whose column values are the reference set. May be schema-qualified.")] string parentTable,
+        [Description("Column on the parent table that holds the reference values (usually its primary key).")] string parentColumn,
+        [Description("Command timeout in seconds for each query. 0 means no timeout. Defaults to 500.")] int timeoutSeconds = DefaultTimeoutSeconds,
+        CancellationToken cancellationToken = default)
+    {
+        var childTableQ  = QualifiedQuoted(childTable);
+        var parentTableQ = QualifiedQuoted(parentTable);
+        var childColQ    = QuoteIdent(childColumn);
+        var parentColQ   = QuoteIdent(parentColumn);
+
+        var countSql =
+            $"SELECT COUNT(*) FROM {childTableQ} c " +
+            $"WHERE c.{childColQ} IS NOT NULL " +
+            $"  AND NOT EXISTS (SELECT 1 FROM {parentTableQ} p WHERE p.{parentColQ} = c.{childColQ});";
+
+        var sampleSql =
+            $"SELECT DISTINCT c.{childColQ} AS orphan_value FROM {childTableQ} c " +
+            $"WHERE c.{childColQ} IS NOT NULL " +
+            $"  AND NOT EXISTS (SELECT 1 FROM {parentTableQ} p WHERE p.{parentColQ} = c.{childColQ}) " +
+            $"LIMIT 100;";
+
+        try
+        {
+            await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+
+            await using var countCmd = new NpgsqlCommand(countSql, connection)
+            {
+                CommandTimeout = timeoutSeconds
+            };
+            var orphanCount = Convert.ToInt64(await countCmd.ExecuteScalarAsync(cancellationToken) ?? 0L);
+
+            var sample = await ReadRowsAsync(connection, sampleSql, timeoutSeconds, cancellationToken);
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                childTable,
+                childColumn,
+                parentTable,
+                parentColumn,
+                orphanCount,
+                isValid = orphanCount == 0,
+                sampleOrphans = sample
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return Error(ex);
+        }
+    }
+
+    [McpServerTool(Name = "list_triggers")]
+    [Description(
+        "Lists triggers in user schemas, decoded from pg_trigger: timing (BEFORE / AFTER / INSTEAD OF), " +
+        "events (INSERT / UPDATE / DELETE / TRUNCATE), row vs. statement level, the function called, " +
+        "whether the trigger is enabled, and the full pg_get_triggerdef text. Internal constraint " +
+        "triggers are filtered out. Triggers are a common hiding place for legacy business logic.")]
+    public static async Task<string> ListTriggers(
+        NpgsqlDataSource dataSource,
+        [Description("Optional table to restrict to (may be schema-qualified). Leave empty for all user tables.")] string? tableName = null,
+        [Description("Command timeout in seconds for this query. 0 means no timeout. Defaults to 500.")] int timeoutSeconds = DefaultTimeoutSeconds,
+        CancellationToken cancellationToken = default)
+    {
+        const string sql = """
+            SELECT n.nspname AS schema_name,
+                   c.relname AS table_name,
+                   t.tgname  AS trigger_name,
+                   CASE
+                       WHEN (t.tgtype & 2)  <> 0 THEN 'BEFORE'
+                       WHEN (t.tgtype & 64) <> 0 THEN 'INSTEAD OF'
+                       ELSE 'AFTER'
+                   END AS timing,
+                   trim(trailing ' ' FROM
+                       (CASE WHEN (t.tgtype & 4)  <> 0 THEN 'INSERT '   ELSE '' END ||
+                        CASE WHEN (t.tgtype & 8)  <> 0 THEN 'DELETE '   ELSE '' END ||
+                        CASE WHEN (t.tgtype & 16) <> 0 THEN 'UPDATE '   ELSE '' END ||
+                        CASE WHEN (t.tgtype & 32) <> 0 THEN 'TRUNCATE ' ELSE '' END)
+                   ) AS events,
+                   CASE WHEN (t.tgtype & 1) <> 0 THEN 'ROW' ELSE 'STATEMENT' END AS level,
+                   p.proname AS function_name,
+                   t.tgenabled <> 'D' AS enabled,
+                   pg_get_triggerdef(t.oid) AS definition
+            FROM pg_trigger t
+            JOIN pg_class c     ON c.oid = t.tgrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_proc p      ON p.oid = t.tgfoid
+            WHERE NOT t.tgisinternal
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND (@schema IS NULL OR n.nspname = @schema)
+              AND (@table  IS NULL OR c.relname = @table)
+            ORDER BY n.nspname, c.relname, t.tgname;
+            """;
+
+        string? schema = null, table = null;
+        if (!string.IsNullOrWhiteSpace(tableName))
+        {
+            var split = SplitTableName(tableName);
+            schema = split.schema;
+            table  = split.table;
+        }
+
+        try
+        {
+            await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+            var triggers = await ReadRowsAsync(connection, sql, timeoutSeconds, cancellationToken,
+                ("schema", schema), ("table", table));
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                triggerCount = triggers.Count,
+                triggers
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return Error(ex);
+        }
+    }
+
+    [McpServerTool(Name = "find_tables_without_primary_key")]
+    [Description(
+        "Returns every user table that has no primary-key constraint, ordered by size descending. " +
+        "Missing primary keys make replication, deduplication and ORM mapping risky, so this is " +
+        "one of the first things to audit when inheriting a legacy database.")]
+    public static async Task<string> FindTablesWithoutPrimaryKey(
+        NpgsqlDataSource dataSource,
+        [Description("Optional schema to restrict to. Leave empty for all user schemas.")] string? schema = null,
+        [Description("Command timeout in seconds for this query. 0 means no timeout. Defaults to 500.")] int timeoutSeconds = DefaultTimeoutSeconds,
+        CancellationToken cancellationToken = default)
+    {
+        const string sql = """
+            SELECT n.nspname                                     AS schema_name,
+                   c.relname                                     AS table_name,
+                   pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
+                   c.reltuples::bigint                           AS estimated_rows
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'p')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND (@schema IS NULL OR n.nspname = @schema)
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_constraint con
+                  WHERE con.conrelid = c.oid AND con.contype = 'p'
+              )
+            ORDER BY pg_total_relation_size(c.oid) DESC;
+            """;
+
+        try
+        {
+            await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+            var tables = await ReadRowsAsync(connection, sql, timeoutSeconds, cancellationToken,
+                ("schema", string.IsNullOrWhiteSpace(schema) ? null : schema));
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                tableCount = tables.Count,
+                tables
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return Error(ex);
+        }
+    }
+
+    [McpServerTool(Name = "sample_table")]
+    [Description(
+        "Returns the first N rows from a table — a quick way to see what data actually lives in a " +
+        "legacy table without writing a SELECT. Table name may be schema-qualified. The limit is " +
+        "clamped between 1 and 1000.")]
+    public static async Task<string> SampleTable(
+        NpgsqlDataSource dataSource,
+        [Description("Table to sample. May be schema-qualified (e.g. 'public.users').")] string tableName,
+        [Description("Number of rows to return (default 10, clamped to 1..1000).")] int limit = 10,
+        [Description("Command timeout in seconds for this query. 0 means no timeout. Defaults to 500.")] int timeoutSeconds = DefaultTimeoutSeconds,
+        CancellationToken cancellationToken = default)
+    {
+        if (limit < 1) limit = 1;
+        if (limit > 1000) limit = 1000;
+
+        var tableQ = QualifiedQuoted(tableName);
+        var sql = $"SELECT * FROM {tableQ} LIMIT @limit;";
+
+        try
+        {
+            await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+            await using var command = new NpgsqlCommand(sql, connection)
+            {
+                CommandTimeout = timeoutSeconds
+            };
+            command.Parameters.Add(new NpgsqlParameter("limit", NpgsqlDbType.Integer) { Value = limit });
+
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+            var columns = new string[reader.FieldCount];
+            for (var i = 0; i < reader.FieldCount; i++)
+                columns[i] = reader.GetName(i);
+
+            var rows = new List<Dictionary<string, object?>>();
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var row = new Dictionary<string, object?>(reader.FieldCount);
+                for (var i = 0; i < reader.FieldCount; i++)
+                    row[columns[i]] = ConvertValue(reader, i);
+                rows.Add(row);
+            }
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                table = tableName,
+                rowCount = rows.Count,
+                columns,
+                rows
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return Error(ex);
+        }
+    }
+
+    [McpServerTool(Name = "get_column_stats")]
+    [Description(
+        "Profiles a single column: total row count, non-null count, null count, distinct count, " +
+        "and MIN / MAX values (cast to text). Helpful for assessing data quality in legacy tables. " +
+        "Can be expensive on large tables — relies on the per-call timeoutSeconds.")]
+    public static async Task<string> GetColumnStats(
+        NpgsqlDataSource dataSource,
+        [Description("Table containing the column. May be schema-qualified.")] string tableName,
+        [Description("Column name to profile.")] string columnName,
+        [Description("Command timeout in seconds for this query. 0 means no timeout. Defaults to 500.")] int timeoutSeconds = DefaultTimeoutSeconds,
+        CancellationToken cancellationToken = default)
+    {
+        var tableQ = QualifiedQuoted(tableName);
+        var colQ   = QuoteIdent(columnName);
+
+        var sql =
+            $"SELECT COUNT(*)                  AS total_count, " +
+            $"       COUNT({colQ})             AS non_null_count, " +
+            $"       COUNT(*) - COUNT({colQ})  AS null_count, " +
+            $"       COUNT(DISTINCT {colQ})    AS distinct_count, " +
+            $"       MIN({colQ})::text         AS min_value, " +
+            $"       MAX({colQ})::text         AS max_value " +
+            $"FROM {tableQ};";
+
+        try
+        {
+            await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+            var rows = await ReadRowsAsync(connection, sql, timeoutSeconds, cancellationToken);
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                table = tableName,
+                column = columnName,
+                stats = rows.Count > 0 ? rows[0] : null
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return Error(ex);
+        }
+    }
+
+    [McpServerTool(Name = "get_table_dependencies")]
+    [Description(
+        "Lists views and materialized views that depend on the given table via pg_depend / " +
+        "pg_rewrite. Run this before altering or dropping a legacy table to see what will break.")]
+    public static async Task<string> GetTableDependencies(
+        NpgsqlDataSource dataSource,
+        [Description("Table to inspect. May be schema-qualified.")] string tableName,
+        [Description("Command timeout in seconds for this query. 0 means no timeout. Defaults to 500.")] int timeoutSeconds = DefaultTimeoutSeconds,
+        CancellationToken cancellationToken = default)
+    {
+        const string sql = """
+            SELECT DISTINCT
+                dn.nspname AS dependent_schema,
+                dc.relname AS dependent_object,
+                CASE dc.relkind
+                    WHEN 'v' THEN 'view'
+                    WHEN 'm' THEN 'materialized view'
+                    WHEN 'r' THEN 'table'
+                    WHEN 'i' THEN 'index'
+                    WHEN 'S' THEN 'sequence'
+                    ELSE dc.relkind::text
+                END AS dependent_type
+            FROM pg_depend d
+            JOIN pg_rewrite r    ON r.oid  = d.objid
+            JOIN pg_class dc     ON dc.oid = r.ev_class
+            JOIN pg_namespace dn ON dn.oid = dc.relnamespace
+            JOIN pg_class tc     ON tc.oid = d.refobjid
+            JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+            WHERE d.classid    = 'pg_rewrite'::regclass
+              AND d.refclassid = 'pg_class'::regclass
+              AND tc.relname = @table
+              AND (@schema IS NULL OR tn.nspname = @schema)
+              AND dc.oid <> tc.oid
+            ORDER BY dn.nspname, dc.relname;
+            """;
+
+        var (schema, table) = SplitTableName(tableName);
+
+        try
+        {
+            await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+            var deps = await ReadRowsAsync(connection, sql, timeoutSeconds, cancellationToken,
+                ("table", table), ("schema", schema));
+
+            return JsonSerializer.Serialize(new
+            {
+                success = true,
+                table = tableName,
+                dependencyCount = deps.Count,
+                dependencies = deps
+            }, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            return Error(ex);
+        }
+    }
+
+    /// <summary>
+    /// Double-quotes an identifier so it can be safely interpolated into SQL.
+    /// Embedded double quotes are escaped per the SQL standard.
+    /// </summary>
+    private static string QuoteIdent(string ident) =>
+        "\"" + ident.Replace("\"", "\"\"") + "\"";
+
+    /// <summary>
+    /// Quotes a (possibly schema-qualified) relation name for safe interpolation.
+    /// </summary>
+    private static string QualifiedQuoted(string fqName)
+    {
+        var (schema, name) = SplitTableName(fqName);
+        return schema is null ? QuoteIdent(name) : QuoteIdent(schema) + "." + QuoteIdent(name);
+    }
+
     /// <summary>
     /// Reads a value from the reader, mapping DBNull to null and keeping JSON-friendly
     /// CLR types as-is; anything exotic is rendered via ToString().
