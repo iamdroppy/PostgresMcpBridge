@@ -167,4 +167,4 @@ The catalog queries target modern PostgreSQL features: `pg_proc.prokind` (PG 11+
 
   # License
   
-  This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+  This project is licensed under the MIT License. See the [LICENSE.txt](LICENSE.txt) file for details.
